@@ -16,10 +16,8 @@
 using namespace ::std;
 using namespace ::concurrency;
 
-mutex mtx_full;
+mutex mtx_queue;
 condition_variable cv_full;
-
-mutex mtx_empty;
 condition_variable cv_empty;
 
 mutex mtx_used;
@@ -95,8 +93,8 @@ void update_func(int table_id, int table_size, int slot_thread_id,
   while (!stopped) {
     // pick up a free-completion slice region from next_slice
     while (!next_slice.try_pop(slice_id)) {
-      // cv_full.notify_all();
-      unique_lock<mutex> lck(mtx_empty);
+      unique_lock<mutex> lck(mtx_queue);
+      cv_full.notify_all();
       cv_empty.wait(lck);
       lck.unlock();
     }
@@ -163,8 +161,8 @@ void gen_slice_id(int table_size, int thread_num) {
   while (!stopped) {
     // wait when next_slice is up to full
     while (next_slice.unsafe_size() >= thread_num * 4) {
-      // cv_empty.notify_all();
-      unique_lock<mutex> lck(mtx_full);
+      unique_lock<mutex> lck(mtx_queue);
+      cv_empty.notify_all();
       cv_full.wait(lck);
       lck.unlock();
     }
@@ -185,7 +183,7 @@ void gen_slice_id(int table_size, int thread_num) {
     next_slice.push(shuffle_slice.back());
     shuffle_slice.pop_back();
     // notify all trans thread when next_slice has more than half of threads
-    if (next_slice.unsafe_size() >= thread_num / 2) {
+    if (next_slice.unsafe_size() > thread_num / 2) {
       cv_empty.notify_all();
     }
   }
