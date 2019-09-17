@@ -17,21 +17,16 @@ using namespace ::std;
 using namespace ::concurrency;
 
 mutex mtx_queue;
-condition_variable cv_full;
 condition_variable cv_empty;
 
 mutex mtx_used;
 condition_variable cv_used;
-
-mutex mtx_start;
-condition_variable cv_start;
 
 mutex mtx;
 
 concurrent_queue<int> next_slice;
 concurrent_queue<int> used_slice;
 
-bool start_run;
 bool stopped;
 
 static unsigned long long total_trx;
@@ -44,6 +39,37 @@ static unsigned long long all_committed_trx;
 static unsigned long long all_rollback_trx;
 
 static vector<chrono::time_point<chrono::high_resolution_clock>> end_time_point;
+
+//thread barrier
+class thread_barrier {
+private:
+	mutex m;
+	condition_variable cv;
+	int counter;
+	int waiting;
+	int thread_count;
+public:
+	thread_barrier() = default;
+	thread_barrier(int count) : waiting(0), counter(0), thread_count(count) {
+	}
+
+	void setCount(int count) {
+		this->thread_count = count;
+	}
+
+	void wait() {
+		unique_lock<mutex> lck(m);
+		counter++;
+		waiting++;
+		cv.wait(lck, [&] {return counter >= thread_count; });
+		cv.notify_one();
+		waiting--;
+		counter = (waiting == 0) ? 0 : counter;
+		lck.unlock();
+	}
+};
+
+thread_barrier barrier;
 
 void update_func(int table_id, int table_size, int slot_thread_id,
                  int update_nums, int thread_num) {
@@ -82,11 +108,7 @@ void update_func(int table_id, int table_size, int slot_thread_id,
   srand(stoi(thread_id.str()));
 
   // wait barrier
-  while (!start_run) {
-    unique_lock<mutex> lck(mtx_start);
-    cv_start.wait(lck);
-    lck.unlock();
-  }
+  barrier.wait();
 
   // transaction
   mysql_autocommit(&conn, false);
@@ -94,12 +116,9 @@ void update_func(int table_id, int table_size, int slot_thread_id,
     // pick up a free-completion slice region from next_slice
     while (!next_slice.try_pop(slice_id)) {
       unique_lock<mutex> lck(mtx_queue);
-      cv_full.notify_all();
+      cv_used.notify_all();
       cv_empty.wait(lck);
       lck.unlock();
-    }
-    if (next_slice.unsafe_size() <= thread_num / 2) {
-      cv_full.notify_all();
     }
 
     ////for multi-thread debug
@@ -159,13 +178,6 @@ void gen_slice_id(int table_size, int thread_num) {
   str << this_thread::get_id();
   srand((unsigned int)stoi(str.str()));
   while (!stopped) {
-    // wait when next_slice is up to full
-    while (next_slice.unsafe_size() >= thread_num * 4) {
-      unique_lock<mutex> lck(mtx_queue);
-      cv_empty.notify_all();
-      cv_full.wait(lck);
-      lck.unlock();
-    }
     // retrieve all items from used_slice
     while (shuffle_slice.empty() && used_slice.empty()) {
       unique_lock<mutex> lck(mtx_used);
@@ -183,7 +195,7 @@ void gen_slice_id(int table_size, int thread_num) {
     next_slice.push(shuffle_slice.back());
     shuffle_slice.pop_back();
     // notify all trans thread when next_slice has more than half of threads
-    if (next_slice.unsafe_size() > thread_num / 2) {
+    if (next_slice.unsafe_size() >= thread_num / 2) {
       cv_empty.notify_all();
     }
   }
@@ -192,7 +204,6 @@ void gen_slice_id(int table_size, int thread_num) {
 void sysbench(int table_id, int thread_num, int duration, int table_size,
               int batch_size) {
   vector<thread> trx_threads;
-  start_run = false;
   total_trx = 0;
   all_committed_trx = 0;
   all_rollback_trx = 0;
@@ -203,6 +214,11 @@ void sysbench(int table_id, int thread_num, int duration, int table_size,
     commit_trx[i] = 0;
     rollback_trx[i] = 0;
   }
+
+  next_slice.clear();
+  used_slice.clear();
+
+  barrier.setCount(thread_num + 1);
 
   for (int i = 0; i < thread_num; i++) {
     trx_threads.push_back(
@@ -215,9 +231,7 @@ void sysbench(int table_id, int thread_num, int duration, int table_size,
   mtx.unlock();
 
   // start oltp test
-  this_thread::sleep_for(chrono::seconds(3));
-  start_run = true;
-  cv_start.notify_all();
+  barrier.wait();
 
   // processing for 5 seconds
   chrono::time_point<chrono::high_resolution_clock> start =
