@@ -3,3 +3,9 @@ A simple tool for running update-only oltp of a built-in or custom storage engin
 
 # Usage
 Cmake tools are needed to generate project, and build it with any compilers
+
+## Supports
+
+* Multi-Statements
+* Batch
+* stored procedure
